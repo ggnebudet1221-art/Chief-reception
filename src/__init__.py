@@ -1,0 +1,1 @@
+"""AI Manager application package."""
