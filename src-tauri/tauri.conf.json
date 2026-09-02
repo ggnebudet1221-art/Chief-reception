@@ -4,23 +4,13 @@
   "version": "0.1.0",
   "identifier": "com.aimanager.desktop",
   "build": {
-    "beforeDevCommand": "",
+    "beforeDevCommand": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts\\desktop-dev-backend.ps1",
     "beforeBuildCommand": "",
     "devUrl": "http://127.0.0.1:8000/",
     "frontendDist": "../web"
   },
   "app": {
-    "windows": [
-      {
-        "title": "AI Manager",
-        "width": 1200,
-        "height": 800,
-        "minWidth": 900,
-        "minHeight": 650,
-        "resizable": true,
-        "fullscreen": false
-      }
-    ],
+    "windows": [],
     "security": {
       "csp": null
     }

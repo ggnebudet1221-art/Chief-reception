@@ -4,5 +4,8 @@ __pycache__/
 node_modules/
 venv/
 .env
+.env.demo
+.env_demo
 *.db
+demo_data/
 src-tauri/target/

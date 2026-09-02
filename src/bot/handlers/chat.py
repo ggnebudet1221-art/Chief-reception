@@ -12,6 +12,8 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import SQLAlchemyError
 
 from src.core.config import get_settings
+from src.bot.telegram_formatting import send_telegram_chunks
+from src.bot.workspace_publisher import TelegramWorkspacePublisher
 from src.infrastructure.db.models.memory import ChatMessage, DayPlanItem, Reminder, Task, UserProfile
 from src.infrastructure.db.session import AsyncSessionLocal
 from src.infrastructure.logging.logger import get_logger
@@ -21,9 +23,21 @@ from src.services.ai.claude_service import (
     ClaudeService,
     ClaudeTemporaryError,
 )
+from src.services.agents import AgentOrchestrator, TelegramContext, WorkspaceEvent
+from src.services.action_engine import ActionEngineService
+from src.services.goals_priorities import GoalsPrioritiesService
+from src.services.opportunity_scout import OpportunityScoutService, ScoutKind
+from src.services.proactive.daily_briefing import DailyBriefingService, LocalWorkspaceBriefingSource
+from src.services.tasks import TaskCreate, TaskService, task_to_dict
+from src.services.web_search import SerperSearchService
 
 router = Router()
 logger = get_logger(__name__)
+task_service = TaskService()
+goals_service = GoalsPrioritiesService()
+action_engine = ActionEngineService()
+opportunity_scout = OpportunityScoutService()
+_orchestrator: AgentOrchestrator | None = None
 
 _waiting_profile_users: set[int] = set()
 _waiting_task_users: set[int] = set()
@@ -32,9 +46,20 @@ _waiting_reminder_users: set[int] = set()
 _scheduler = None
 
 
+def _orchestrator_instance() -> AgentOrchestrator:
+    global _orchestrator
+    if _orchestrator is None:
+        _orchestrator = AgentOrchestrator()
+    return _orchestrator
+
+
 def set_reminder_scheduler(scheduler) -> None:
     global _scheduler
     _scheduler = scheduler
+
+
+def _workspace_user_id() -> int:
+    return get_settings().web_owner_id
 
 
 def _clear_pending_state(user_id: int) -> None:
@@ -45,11 +70,7 @@ def _clear_pending_state(user_id: int) -> None:
 
 
 def _resolve_user_id(message: Message, fallback_user_id: int | None = None) -> int:
-    if message.from_user:
-        return message.from_user.id
-    if fallback_user_id is not None:
-        return fallback_user_id
-    return get_settings().owner_telegram_id or 0
+    return _workspace_user_id()
 
 
 def _resolve_chat_id(message: Message, fallback_chat_id: int | None = None, user_id: int | None = None) -> int:
@@ -65,9 +86,16 @@ def _resolve_chat_id(message: Message, fallback_chat_id: int | None = None, user
 async def _is_allowed_user(message: Message) -> bool:
     owner_id = get_settings().owner_telegram_id
     uid = message.from_user.id if message.from_user else None
-    if owner_id is None:
+    if not owner_id:
         return True
     if uid != owner_id:
+        logger.warning(
+            "Telegram user rejected by OWNER_TELEGRAM_ID",
+            owner_telegram_id=owner_id,
+            incoming_user_id=uid,
+            chat_id=message.chat.id if message.chat else None,
+            text=message.text,
+        )
         await message.answer("Доступ закрыт.")
         return False
     return True
@@ -76,7 +104,7 @@ async def _is_allowed_user(message: Message) -> bool:
 async def _is_allowed_callback(callback: CallbackQuery) -> bool:
     owner_id = get_settings().owner_telegram_id
     uid = callback.from_user.id if callback.from_user else None
-    if owner_id is None:
+    if not owner_id:
         return True
     if uid != owner_id:
         await callback.answer("Доступ закрыт.", show_alert=True)
@@ -144,6 +172,22 @@ def _parse_reminder_input(raw: str) -> tuple[str, datetime] | None:
     return None
 
 
+async def _create_user_task(user_id: int, title: str, source: str) -> Task:
+    return await task_service.create(
+        TaskCreate(
+            user_id=user_id,
+            title=title,
+            status="active",
+            task_type="user_task",
+            assigned_agent="Chief",
+            created_by="telegram",
+            source=source,
+            current_step="Waiting for CEO",
+            action_log=f"Created from {source}",
+        )
+    )
+
+
 async def _create_reminder(user_id: int, chat_id: int, text: str, remind_at: datetime) -> Reminder | None:
     if remind_at <= datetime.now(_tz()):
         return None
@@ -162,7 +206,7 @@ async def _create_reminder(user_id: int, chat_id: int, text: str, remind_at: dat
 async def cancel_state_handler(message: Message) -> None:
     if not await _is_allowed_user(message):
         return
-    uid = message.from_user.id if message.from_user else 0
+    uid = message.from_user.id if message.from_user else _workspace_user_id()
     _clear_pending_state(uid)
     await message.answer("Текущий режим ожидания отменён.")
 
@@ -179,17 +223,81 @@ async def debug_ids_handler(message: Message) -> None:
     await message.answer(f"user_id={uid}\nchat_id={cid}\nOWNER_TELEGRAM_ID={owner}")
 
 
+@router.message(Command("debug_chat_ids"))
+async def debug_chat_ids_handler(message: Message, bot_agent_id: str = "chief") -> None:
+    if not await _is_allowed_user(message):
+        return
+    chat_id = message.chat.id if message.chat else None
+    thread_id = getattr(message, "message_thread_id", None)
+    topic_title = "unknown"
+    topic_type = "direct"
+    if message.chat and getattr(message.chat, "is_forum", False):
+        topic_type = "forum_topic" if thread_id else "forum_general"
+    elif message.chat:
+        topic_type = message.chat.type or "unknown"
+
+    topic_created = getattr(message, "forum_topic_created", None)
+    if topic_created and getattr(topic_created, "name", None):
+        topic_title = topic_created.name
+    elif message.reply_to_message:
+        reply_topic_created = getattr(message.reply_to_message, "forum_topic_created", None)
+        if reply_topic_created and getattr(reply_topic_created, "name", None):
+            topic_title = reply_topic_created.name
+    elif thread_id:
+        topic_title = f"thread_{thread_id}"
+    elif message.chat and getattr(message.chat, "title", None):
+        topic_title = message.chat.title
+
+    await message.answer(
+        "\n".join(
+            [
+                f"Chat ID: {chat_id}",
+                f"Thread ID: {thread_id or 0}",
+                f"Topic: {topic_title}",
+                f"Topic type: {topic_type}",
+            ]
+        )
+    )
+
+
 @router.message(Command("debugdata"))
 async def debug_data_handler(message: Message) -> None:
     if not await _is_allowed_user(message):
         return
-    uid = message.from_user.id if message.from_user else 0
+    uid = _workspace_user_id()
+    active_tasks = await task_service.list_open(user_id=uid, task_type="user_task", limit=200)
     async with AsyncSessionLocal() as session:
-        tasks_count = len((await session.execute(select(Task).where(Task.user_id == uid, Task.status == "active"))).scalars().all())
         plan_count = len((await session.execute(select(DayPlanItem).where(DayPlanItem.user_id == uid, DayPlanItem.plan_date == date.today(), DayPlanItem.status == "active"))).scalars().all())
         rem_count = len((await session.execute(select(Reminder).where(Reminder.user_id == uid, Reminder.status == "active"))).scalars().all())
         profile = await session.get(UserProfile, uid)
-    await message.answer(f"active_tasks={tasks_count}\nactive_plan_today={plan_count}\nactive_reminders={rem_count}\nprofile_exists={'yes' if profile and profile.profile_text else 'no'}")
+    await message.answer(f"active_tasks={len(active_tasks)}\nactive_plan_today={plan_count}\nactive_reminders={rem_count}\nprofile_exists={'yes' if profile and profile.profile_text else 'no'}")
+
+
+@router.message(Command("debug_search"))
+async def debug_search_handler(message: Message, bot_agent_id: str = "chief") -> None:
+    if not await _is_allowed_user(message):
+        return
+    query = (message.text or "").replace("/debug_search", "", 1).strip() or "weather in Kemer"
+    logger.info("[SERPER] debug command entered", agent=bot_agent_id, query=query)
+    debug = await SerperSearchService(max_results=5).debug(query)
+    preview = str(debug.get("raw_preview") or "").replace("\n", " ")[:650]
+    parsed = debug.get("parsed_results") or []
+    titles = "\n".join([f"- {item.get('title', '')}" for item in parsed[:3] if isinstance(item, dict)])
+    await message.answer(
+        "\n".join(
+            [
+                f"Search status: {'ok' if debug.get('api_reachable') else 'fail'}",
+                f"Key loaded: {str(debug.get('key_loaded')).lower()}",
+                f"Status code: {debug.get('status_code')}",
+                f"Results count: {debug.get('results_count')}",
+                f"Error: {debug.get('error') or '-'}",
+                f"Raw preview: {preview or '-'}",
+                "Parsed:",
+                titles or "-",
+            ]
+        )
+    )
+    logger.info("[SERPER] debug command reply sent", agent=bot_agent_id, query=query, results_count=debug.get("results_count"))
 
 @router.message(Command("menu"))
 async def menu_handler(message: Message) -> None:
@@ -204,27 +312,28 @@ async def menu_callback(callback: CallbackQuery) -> None:
     if not await _is_allowed_callback(callback):
         return
     data = callback.data or ""
-    uid = callback.from_user.id if callback.from_user else 0
+    tg_uid = callback.from_user.id if callback.from_user else 0
+    uid = _workspace_user_id()
     try:
         if data.startswith("menu:section:"):
             await callback.message.edit_text("Выбери действие:", reply_markup=_menu_section(data.split(":")[-1]))
         elif data == "menu:back":
             await callback.message.edit_text("Главное меню:", reply_markup=_menu_main())
         elif data == "menu:tasks:add":
-            _clear_pending_state(uid)
-            _waiting_task_users.add(uid)
+            _clear_pending_state(tg_uid)
+            _waiting_task_users.add(tg_uid)
             await callback.message.answer("Отправь текст задачи одним сообщением.")
         elif data == "menu:plan:add":
-            _clear_pending_state(uid)
-            _waiting_plan_users.add(uid)
+            _clear_pending_state(tg_uid)
+            _waiting_plan_users.add(tg_uid)
             await callback.message.answer("Отправь текст пункта плана одним сообщением.")
         elif data == "menu:reminders:add":
-            _clear_pending_state(uid)
-            _waiting_reminder_users.add(uid)
+            _clear_pending_state(tg_uid)
+            _waiting_reminder_users.add(tg_uid)
             await callback.message.answer("Напиши напоминание: текст | YYYY-MM-DD HH:MM")
         elif data == "menu:profile:set":
-            _clear_pending_state(uid)
-            _waiting_profile_users.add(uid)
+            _clear_pending_state(tg_uid)
+            _waiting_profile_users.add(tg_uid)
             await callback.message.answer("Отправь новый профиль одним сообщением (до 300 символов).")
         elif data == "menu:tasks:list":
             await todo_handler(callback.message, skip_access_check=True, forced_user_id=uid)
@@ -246,8 +355,7 @@ async def menu_callback(callback: CallbackQuery) -> None:
         elif data == "menu:profile:clear":
             await clear_profile_handler(callback.message, skip_access_check=True, forced_user_id=uid)
         elif data == "menu:tasks:done":
-            async with AsyncSessionLocal() as session:
-                rows = (await session.execute(select(Task).where(Task.user_id == uid, Task.status == "active").order_by(Task.id.asc()))).scalars().all()
+            rows = await task_service.list_open(user_id=uid, task_type="user_task", limit=80)
             if not rows:
                 await callback.message.answer("Активных задач нет.")
             else:
@@ -279,16 +387,13 @@ async def menu_callback(callback: CallbackQuery) -> None:
 async def task_done_callback(callback: CallbackQuery) -> None:
     if not await _is_allowed_callback(callback):
         return
-    uid = callback.from_user.id if callback.from_user else 0
+    uid = _workspace_user_id()
     tid = int((callback.data or "0").split(":")[-1])
-    async with AsyncSessionLocal() as session:
-        task = await session.get(Task, tid)
-        if task is None or task.user_id != uid:
-            await callback.answer("Задача не найдена.", show_alert=True)
-            return
-        task.status = "done"
-        task.completed_at = datetime.now(timezone.utc)
-        await session.commit()
+    task = await task_service.get_for_user(task_id=tid, user_id=uid)
+    if task is None:
+        await callback.answer("Задача не найдена.", show_alert=True)
+        return
+    await task_service.complete(task_id=tid, user_id=uid)
     await callback.message.answer("Готово. Задача отмечена выполненной.")
     await callback.answer()
 
@@ -297,7 +402,7 @@ async def task_done_callback(callback: CallbackQuery) -> None:
 async def plan_done_callback(callback: CallbackQuery) -> None:
     if not await _is_allowed_callback(callback):
         return
-    uid = callback.from_user.id if callback.from_user else 0
+    uid = _workspace_user_id()
     pid = int((callback.data or "0").split(":")[-1])
     async with AsyncSessionLocal() as session:
         item = await session.get(DayPlanItem, pid)
@@ -315,7 +420,7 @@ async def plan_done_callback(callback: CallbackQuery) -> None:
 async def reminder_cancel_callback(callback: CallbackQuery) -> None:
     if not await _is_allowed_callback(callback):
         return
-    uid = callback.from_user.id if callback.from_user else 0
+    uid = _workspace_user_id()
     rid = int((callback.data or "0").split(":")[-1])
     async with AsyncSessionLocal() as session:
         rem = await session.get(Reminder, rid)
@@ -333,7 +438,7 @@ async def reminder_cancel_callback(callback: CallbackQuery) -> None:
 async def remind_handler(message: Message) -> None:
     if not await _is_allowed_user(message):
         return
-    uid = message.from_user.id if message.from_user else 0
+    uid = _workspace_user_id()
     raw = (message.text or "").replace("/remind", "", 1).strip()
     parsed = _parse_reminder_input(raw)
     if not parsed:
@@ -377,7 +482,7 @@ async def reminders_handler(message: Message, skip_access_check: bool = False, f
 async def cancel_reminder_handler(message: Message) -> None:
     if not await _is_allowed_user(message):
         return
-    uid = message.from_user.id if message.from_user else 0
+    uid = _workspace_user_id()
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].isdigit():
         await message.answer("Коротко: /cancelreminder id")
@@ -400,8 +505,7 @@ async def todo_handler(message: Message, skip_access_check: bool = False, forced
     if not skip_access_check and not await _is_allowed_user(message):
         return
     uid = _resolve_user_id(message, forced_user_id)
-    async with AsyncSessionLocal() as session:
-        rows = (await session.execute(select(Task).where(Task.user_id == uid, Task.status == "active").order_by(Task.id.asc()))).scalars().all()
+    rows = await task_service.list_open(user_id=uid, task_type="user_task", limit=80)
     if not rows:
         await message.answer("Активных задач нет.")
         return
@@ -436,7 +540,88 @@ async def profile_handler(message: Message, skip_access_check: bool = False, for
     async with AsyncSessionLocal() as session:
         profile = await session.get(UserProfile, uid)
     text = profile.profile_text if profile and profile.profile_text else "(профиль не задан)"
-    await message.answer(f"Текущий профиль:\n{html.escape(text)}")
+    goals_text = await goals_service.telegram_profile_text()
+    await message.answer(f"<b>Текущий профиль</b>\n{html.escape(text)}\n\n{goals_text}")
+
+
+@router.message(Command("priorities"))
+async def priorities_handler(message: Message, skip_access_check: bool = False, forced_user_id: int | None = None) -> None:
+    if not skip_access_check and not await _is_allowed_user(message):
+        return
+    await message.answer(await goals_service.telegram_profile_text())
+
+
+@router.message(Command("next_action"))
+async def next_action_handler(message: Message, skip_access_check: bool = False, forced_user_id: int | None = None) -> None:
+    if not skip_access_check and not await _is_allowed_user(message):
+        return
+    uid = _resolve_user_id(message, forced_user_id)
+    await message.answer(await action_engine.next_action(uid))
+
+
+async def _send_proactive_now(message: Message, kind: str, forced_user_id: int | None = None) -> None:
+    uid = _resolve_user_id(message, forced_user_id)
+    service = DailyBriefingService()
+    context = await LocalWorkspaceBriefingSource().collect(uid)
+    text = await service._generate("morning" if kind == "morning" else "evening", context)
+
+    async def answer(chunk: str) -> None:
+        await message.answer(chunk, parse_mode="HTML")
+
+    await send_telegram_chunks(answer, text, logger=logger, agent="chief", kind=f"{kind}_now")
+
+
+@router.message(Command("brief_now"))
+async def brief_now_handler(message: Message, skip_access_check: bool = False, forced_user_id: int | None = None) -> None:
+    if not skip_access_check and not await _is_allowed_user(message):
+        return
+    await _send_proactive_now(message, "morning", forced_user_id)
+
+
+@router.message(Command("reflection_now"))
+async def reflection_now_handler(message: Message, skip_access_check: bool = False, forced_user_id: int | None = None) -> None:
+    if not skip_access_check and not await _is_allowed_user(message):
+        return
+    await _send_proactive_now(message, "evening", forced_user_id)
+
+
+async def _send_scout(message: Message, kind: ScoutKind, forced_user_id: int | None = None) -> None:
+    uid = _resolve_user_id(message, forced_user_id)
+    result = await opportunity_scout.run(uid, kind)
+
+    async def answer(chunk: str) -> None:
+        await message.answer(chunk, parse_mode="HTML")
+
+    await send_telegram_chunks(answer, result.text, logger=logger, agent="chief", kind=f"scout_{kind}")
+    await opportunity_scout.mark_sent(result.history_id)
+
+
+@router.message(Command("scout"))
+async def scout_handler(message: Message, skip_access_check: bool = False, forced_user_id: int | None = None) -> None:
+    if not skip_access_check and not await _is_allowed_user(message):
+        return
+    await _send_scout(message, "general", forced_user_id)
+
+
+@router.message(Command("scout_business"))
+async def scout_business_handler(message: Message, skip_access_check: bool = False, forced_user_id: int | None = None) -> None:
+    if not skip_access_check and not await _is_allowed_user(message):
+        return
+    await _send_scout(message, "business", forced_user_id)
+
+
+@router.message(Command("scout_tools"))
+async def scout_tools_handler(message: Message, skip_access_check: bool = False, forced_user_id: int | None = None) -> None:
+    if not skip_access_check and not await _is_allowed_user(message):
+        return
+    await _send_scout(message, "tools", forced_user_id)
+
+
+@router.message(Command("scout_clients"))
+async def scout_clients_handler(message: Message, skip_access_check: bool = False, forced_user_id: int | None = None) -> None:
+    if not skip_access_check and not await _is_allowed_user(message):
+        return
+    await _send_scout(message, "clients", forced_user_id)
 
 
 @router.message(Command("clearprofile"))
@@ -458,10 +643,11 @@ async def clear_tasks_handler(message: Message, skip_access_check: bool = False,
     if not skip_access_check and not await _is_allowed_user(message):
         return
     uid = _resolve_user_id(message, forced_user_id)
+    completed = await task_service.list_completed(user_id=uid, task_type="user_task", limit=500)
     async with AsyncSessionLocal() as session:
-        res = await session.execute(delete(Task).where(Task.user_id == uid, Task.status == "done"))
+        res = await session.execute(delete(Task).where(Task.id.in_([task.id for task in completed]))) if completed else None
         await session.commit()
-    await message.answer(f"Удалено выполненных задач: {res.rowcount or 0}.")
+    await message.answer(f"Удалено выполненных задач: {(res.rowcount if res else 0) or 0}.")
 
 
 @router.message(Command("clearplan"))
@@ -476,33 +662,41 @@ async def clear_plan_handler(message: Message, skip_access_check: bool = False, 
 
 
 @router.message()
-async def chat_handler(message: Message) -> None:
-    logger.info("Message handler called")
+async def chat_handler(message: Message, bot_agent_id: str = "chief") -> None:
+    logger.info(
+        f"[{bot_agent_id}] handler entered",
+        agent=bot_agent_id,
+        chat_id=message.chat.id if message.chat else None,
+        user_id=message.from_user.id if message.from_user else None,
+        text=message.text,
+    )
     if not await _is_allowed_user(message):
         return
-    uid = message.from_user.id if message.from_user else 0
+    tg_uid = message.from_user.id if message.from_user else 0
+    uid = _workspace_user_id()
     text = (message.text or "").strip()
     if not text:
         await message.answer("Пожалуйста, отправь текстовое сообщение.")
+        logger.info(f"[{bot_agent_id}] reply sent", agent=bot_agent_id, kind="empty_text")
         return
 
-    if uid in _waiting_task_users:
-        async with AsyncSessionLocal() as session:
-            session.add(Task(user_id=uid, title=text, status="active"))
-            await session.commit()
-        _clear_pending_state(uid)
+    if tg_uid in _waiting_task_users:
+        await _create_user_task(uid, text, "telegram_menu")
+        _clear_pending_state(tg_uid)
         await message.answer("Задача добавлена.")
+        logger.info(f"[{bot_agent_id}] reply sent", agent=bot_agent_id, kind="task_created")
         return
 
-    if uid in _waiting_plan_users:
+    if tg_uid in _waiting_plan_users:
         async with AsyncSessionLocal() as session:
             session.add(DayPlanItem(user_id=uid, title=text, status="active", plan_date=date.today()))
             await session.commit()
-        _clear_pending_state(uid)
+        _clear_pending_state(tg_uid)
         await message.answer("Пункт плана добавлен.")
+        logger.info(f"[{bot_agent_id}] reply sent", agent=bot_agent_id, kind="plan_created")
         return
 
-    if uid in _waiting_profile_users:
+    if tg_uid in _waiting_profile_users:
         if len(text) > 300:
             await message.answer("Профиль слишком длинный. Сократи до 300 символов.")
             return
@@ -513,11 +707,12 @@ async def chat_handler(message: Message) -> None:
             else:
                 profile.profile_text = text
             await session.commit()
-        _clear_pending_state(uid)
+        _clear_pending_state(tg_uid)
         await message.answer("Профиль сохранён.")
+        logger.info(f"[{bot_agent_id}] reply sent", agent=bot_agent_id, kind="profile_saved")
         return
 
-    if uid in _waiting_reminder_users:
+    if tg_uid in _waiting_reminder_users:
         parsed = _parse_reminder_input(text)
         if not parsed:
             await message.answer("Не понял время. Напиши так: напомни через 20 минут проверить монтаж или /remind текст | YYYY-MM-DD HH:MM")
@@ -527,8 +722,9 @@ async def chat_handler(message: Message) -> None:
         if rem is None:
             await message.answer("Дата уже в прошлом.")
             return
-        _clear_pending_state(uid)
+        _clear_pending_state(tg_uid)
         await message.answer(f"⏰ Напоминание создано: {html.escape(t)} — {dt.strftime('%Y-%m-%d %H:%M')}")
+        logger.info(f"[{bot_agent_id}] reply sent", agent=bot_agent_id, kind="reminder_created")
         return
 
     if re.search(r"напомни|создай напоминание|поставь напоминание|напомнить", text, re.IGNORECASE):
@@ -541,46 +737,49 @@ async def chat_handler(message: Message) -> None:
         if rem is None:
             await message.answer("Дата уже в прошлом.")
             return
-        _clear_pending_state(uid)
+        _clear_pending_state(tg_uid)
         await message.answer(f"⏰ Напоминание создано: {html.escape(t)} — {dt.strftime('%Y-%m-%d %H:%M')}")
+        logger.info(f"[{bot_agent_id}] reply sent", agent=bot_agent_id, kind="reminder_created")
         return
 
-    settings = get_settings()
-    async with AsyncSessionLocal() as session:
-        session.add(ChatMessage(user_id=uid, role="user", content=text))
-        await session.commit()
-        history = list(reversed((await session.execute(select(ChatMessage).where(ChatMessage.user_id == uid).order_by(ChatMessage.created_at.desc()).limit(settings.max_history_messages))).scalars().all()))
-        profile = await session.get(UserProfile, uid)
-        tasks = (await session.execute(select(Task).where(Task.user_id == uid, Task.status == "active").order_by(Task.id.asc()).limit(10))).scalars().all()
-        plans = (await session.execute(select(DayPlanItem).where(DayPlanItem.user_id == uid, DayPlanItem.plan_date == date.today(), DayPlanItem.status == "active").order_by(DayPlanItem.id.asc()).limit(10))).scalars().all()
-        reminders = (await session.execute(select(Reminder).where(Reminder.user_id == uid, Reminder.status == "active").order_by(Reminder.remind_at.asc()).limit(5))).scalars().all()
-
-    system_prompt = settings.default_system_prompt
-    if profile and profile.profile_text:
-        system_prompt += f"\n\nИнформация о пользователе: {profile.profile_text}"
-    ctx: list[str] = []
-    if tasks:
-        ctx += ["Активные задачи:"] + [f"{i+1}. {t.title}" for i, t in enumerate(tasks)]
-    if plans:
-        if ctx:
-            ctx.append("")
-        ctx += ["План на сегодня:"] + [f"{i+1}. {p.title}" for i, p in enumerate(plans)]
-    if reminders:
-        if ctx:
-            ctx.append("")
-        ctx += ["Ближайшие напоминания:"] + [f"{i+1}. {r.text} ({r.remind_at.strftime('%H:%M')})" for i, r in enumerate(reminders)]
-    if ctx:
-        system_prompt += "\n\nРабочий контекст пользователя:\n" + "\n".join(ctx)
-
-    msgs = [{"role": m.role, "content": m.content} for m in history if m.role in {"user", "assistant"}]
+    publisher = TelegramWorkspacePublisher(message.bot)
     try:
-        reply = await ClaudeService().generate_response(system_prompt=system_prompt, history_messages=msgs, max_tokens=settings.claude_max_tokens)
+        result = await _orchestrator_instance().handle_telegram_message(
+            TelegramContext(
+                telegram_user_id=tg_uid,
+                chat_id=message.chat.id if message.chat else 0,
+                text=text,
+                source_agent_id=bot_agent_id,
+                event_sink=publisher.publish,
+            )
+        )
     except (ClaudeConfigurationError, ClaudeTemporaryError, ClaudeEmptyResponseError):
-        await message.answer("Сервис AI временно недоступен. Попробуй чуть позже.")
+        await publisher.publish(WorkspaceEvent("infra", "SYSTEM", "ai_generation_unavailable", status="FAILED"))
+        await message.answer("Не удалось получить часть данных. Показываю то, что удалось найти, либо повторю через минуту.")
+        logger.info(f"[{bot_agent_id}] reply sent", agent=bot_agent_id, kind="ai_unavailable")
+        return
+    except Exception:
+        logger.exception("Telegram orchestration failed", telegram_user_id=tg_uid)
+        await publisher.publish(WorkspaceEvent("infra", "SYSTEM", "Один из шагов обработки не завершился. Ответ отправлен в частичном режиме.", status="FAILED"))
+        await message.answer("Не удалось получить часть данных по маршруту. Показываю то, что удалось найти. Попробуй повторить запрос через минуту, если нужен полный расчёт.")
+        logger.info(f"[{bot_agent_id}] reply sent", agent=bot_agent_id, kind="error")
         return
 
-    async with AsyncSessionLocal() as session:
-        session.add(ChatMessage(user_id=uid, role="assistant", content=reply))
-        await session.commit()
-    await message.answer(_format_html(reply))
+    if result.reply.strip():
+        await send_telegram_chunks(
+            message.answer,
+            result.reply,
+            logger=logger,
+            agent=bot_agent_id,
+            kind="orchestration",
+            task_id=result.task_id,
+        )
+        logger.info(f"[{bot_agent_id}] reply sent", agent=bot_agent_id, kind="orchestration", task_id=result.task_id)
+    else:
+        logger.info(
+            f"[{bot_agent_id}] orchestration completed without direct reply",
+            agent=bot_agent_id,
+            kind="orchestration_silent",
+            task_id=result.task_id,
+        )
 

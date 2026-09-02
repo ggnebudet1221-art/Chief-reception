@@ -12,7 +12,9 @@ rust-version = "1.77"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["unstable"] }
+tao = "0.35.2"
+wry = "0.55.1"
 
 [features]
 default = ["custom-protocol"]

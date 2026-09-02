@@ -21,8 +21,10 @@ dependencies = [
 name = "ai-manager-desktop"
 version = "0.1.0"
 dependencies = [
+ "tao",
  "tauri",
  "tauri-build",
+ "wry",
 ]
 
 [[package]]
